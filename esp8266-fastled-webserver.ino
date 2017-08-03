@@ -5,11 +5,10 @@
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
    the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+   (at your optilys.localon) any later version.
 
    This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   but WITHOUT ANY WARRANTY;
    GNU General Public License for more details.
 
    You should have received a copy of the GNU General Public License
@@ -23,36 +22,37 @@ extern "C" {
 #include "user_interface.h"
 }
 
-#include <ESP8266WiFi.h>
+
+#include "network.h"
 #include <ESP8266WebServer.h>
-#include <FS.h>
+
 #include <EEPROM.h>
-#include <IRremoteESP8266.h>
+#include <Time.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+//#include <IRremoteESP8266.h>
 #include "GradientPalettes.h"
 
-#define RECV_PIN 12
-IRrecv irReceiver(RECV_PIN);
+//#define RECV_PIN 12
+//IRrecv irReceiver(RECV_PIN);
 
 #include "Commands.h"
 
-const bool apMode = false;
-
-// AP mode password
-const char WiFiAPPSK[] = "";
-
-// Wi-Fi network to connect to (if not in AP mode)
-const char* ssid = "";
-const char* password = "";
 
 ESP8266WebServer server(80);
 
-#define DATA_PIN      D8     // for Huzzah: Pins w/o special function:  #4, #5, #12, #13, #14; // #16 does not work :(
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP);
+
+#define BRYTER 5
+
+#define DATA_PIN 14         // for Huzzah: Pins w/o special function:  #4, #5, #12, #13, #14; // #16 does not work :(
 #define LED_TYPE      WS2812
 #define COLOR_ORDER   GRB
-#define NUM_LEDS      24
+#define NUM_LEDS      556
 
-#define MILLI_AMPS         2000     // IMPORTANT: set here the max milli-Amps of your power supply 5V 2A = 2000
-#define FRAMES_PER_SECOND  120 // here you can control the speed. With the Access Point / Web Server the animations run a bit slower.
+#define MILLI_AMPS         40000     // IMPORTANT: set here the max milli-Amps of your power supply 5V 2A = 2000
+#define FRAMES_PER_SECOND  60 // here you can control the speed. With the Access Point / Web Server the animations run a bit slower.
 
 CRGB leds[NUM_LEDS];
 
@@ -62,6 +62,10 @@ const uint8_t brightnessCount = 5;
 uint8_t brightnessMap[brightnessCount] = { 16, 32, 64, 128, 255 };
 int brightnessIndex = 0;
 uint8_t brightness = brightnessMap[brightnessIndex];
+
+time_t alarm_start; 
+time_t alarm; 
+
 
 #define ARRAY_SIZE(A) (sizeof(A) / sizeof((A)[0]))
 
@@ -85,37 +89,83 @@ CRGBPalette16 gTargetPalette( gGradientPalettes[0] );
 
 uint8_t currentPatternIndex = 0; // Index number of which pattern is current
 bool autoplayEnabled = false;
-
 uint8_t autoPlayDurationSeconds = 10;
 unsigned int autoPlayTimeout = 0;
-
 uint8_t currentPaletteIndex = 0;
-
 uint8_t gHue = 0; // rotating "base color" used by many of the patterns
 
 CRGB solidColor = CRGB::Blue;
 
 uint8_t power = 1;
+bool ota=true;
+File fsUploadFile;
+
+void fileUpload()
+{
+  if(server.uri() != "/upload") return;
+  HTTPUpload& upload = server.upload();
+  if(upload.status == UPLOAD_FILE_START){
+    String filename = upload.filename;
+    if(!filename.startsWith("/")) filename = "/"+filename;
+    Serial.print("handleFileUpload Name: "); 
+    Serial.println(filename);
+    fsUploadFile = SPIFFS.open(filename, "w");
+    filename = String();
+  } else if(upload.status == UPLOAD_FILE_WRITE){
+    Serial.print("handleFileUpload Data: "); 
+    Serial.println(upload.currentSize);
+    if(fsUploadFile)
+      fsUploadFile.write(upload.buf, upload.currentSize);
+  } else if(upload.status == UPLOAD_FILE_END){
+    if(fsUploadFile)
+      fsUploadFile.close();
+    Serial.print("handleFileUpload Size: ");
+    Serial.println(upload.totalSize);
+  }
+
+}
+
+void toggle_on() {
+
+  detachInterrupt(BRYTER);
+  setBrightness(200);
+  setSolidColor(252,255,75);
+  setPower(1);
+  attachInterrupt(BRYTER, toggle_off, RISING);
+}
+void toggle_off() {
+  detachInterrupt(BRYTER);
+  setPower(0);
+  attachInterrupt(BRYTER, toggle_on, FALLING);
+}
+
 
 void setup(void) {
-  Serial.begin(115200);
-  delay(100);
-  Serial.setDebugOutput(true);
 
+  Serial.begin(115200);
+  
   FastLED.addLeds<LED_TYPE, DATA_PIN, COLOR_ORDER>(leds, NUM_LEDS);         // for WS2812 (Neopixel)
   //FastLED.addLeds<LED_TYPE,DATA_PIN,CLK_PIN,COLOR_ORDER>(leds, NUM_LEDS); // for APA102 (Dotstar)
   FastLED.setCorrection(TypicalLEDStrip);
   FastLED.setBrightness(brightness);
   FastLED.setMaxPowerInVoltsAndMilliamps(5, MILLI_AMPS);
+  
+  setSolidColor(252,255,75);
+  
+  setBrightness(200);
   fill_solid(leds, NUM_LEDS, solidColor);
+
   FastLED.show();
+
+  //initialiserer bryterern
+  pinMode(BRYTER, INPUT);
+  attachInterrupt(BRYTER, toggle_on, FALLING);
 
   EEPROM.begin(512);
   loadSettings();
 
-  FastLED.setBrightness(brightness);
-
-  irReceiver.enableIRIn(); // Start the receiver
+  //setPower(0);
+  //irReceiver.enableIRIn(); // Start the receiver
 
   Serial.println();
   Serial.print( F("Heap: ") ); Serial.println(system_get_free_heap_size());
@@ -138,53 +188,26 @@ void setup(void) {
     }
     Serial.printf("\n");
   }
+ 
 
-  if (apMode)
-  {
-    WiFi.mode(WIFI_AP);
+ delay(10);
 
-    // Do a little work to get a unique-ish name. Append the
-    // last two bytes of the MAC (HEX'd) to "Thing-":
-    uint8_t mac[WL_MAC_ADDR_LENGTH];
-    WiFi.softAPmacAddress(mac);
-    String macID = String(mac[WL_MAC_ADDR_LENGTH - 2], HEX) +
-                   String(mac[WL_MAC_ADDR_LENGTH - 1], HEX);
-    macID.toUpperCase();
-    String AP_NameString = "ESP8266 Thing " + macID;
+ //initialiserer wifi.
+ setupNetwork();
 
-    char AP_NameChar[AP_NameString.length() + 1];
-    memset(AP_NameChar, 0, AP_NameString.length() + 1);
-
-    for (int i = 0; i < AP_NameString.length(); i++)
-      AP_NameChar[i] = AP_NameString.charAt(i);
-
-    WiFi.softAP(AP_NameChar, WiFiAPPSK);
-
-    Serial.printf("Connect to Wi-Fi access point: %s\n", AP_NameChar);
-    Serial.println("and open http://192.168.4.1 in your browser");
-  }
-  else
-  {
-    WiFi.mode(WIFI_STA);
-    Serial.printf("Connecting to %s\n", ssid);
-    if (String(WiFi.SSID()) != String(ssid)) {
-      WiFi.begin(ssid, password);
-    }
-
-    while (WiFi.status() != WL_CONNECTED) {
-      delay(500);
-      Serial.print(".");
-    }
-
-    Serial.print("Connected! Open http://");
-    Serial.print(WiFi.localIP());
-    Serial.println(" in your browser");
-  }
-
-  //  server.serveStatic("/", SPIFFS, "/index.htm"); // ,"max-age=86400"
+ delay(100);
 
   server.on("/all", HTTP_GET, []() {
     sendAll();
+  });
+    server.on("/ota", HTTP_GET, []() {
+    sendOta();
+  });
+
+  server.on("/ota", HTTP_POST, []() {
+    String value = server.arg("value");
+    setOta(value.toInt());
+    sendOta();
   });
 
   server.on("/power", HTTP_GET, []() {
@@ -195,6 +218,16 @@ void setup(void) {
     String value = server.arg("value");
     setPower(value.toInt());
     sendPower();
+  });
+  server.on("/setWifi", HTTP_POST, []() {
+    String ssid = server.arg("ssid");
+    String pass = server.arg("pass");
+
+    saveConfig(ssid, pass);
+    sendPower();
+
+
+    saveConfig(ssid, pass);
   });
 
   server.on("/solidColor", HTTP_GET, []() {
@@ -239,6 +272,7 @@ void setup(void) {
     sendBrightness();
   });
 
+
   server.on("/brightnessUp", HTTP_POST, []() {
     adjustBrightness(true);
     sendBrightness();
@@ -255,8 +289,8 @@ void setup(void) {
 
   server.on("/palette", HTTP_POST, []() {
     String value = server.arg("value");
-    setPalette(value.toInt());
-    sendPalette();
+    
+
   });
 
   server.serveStatic("/index.htm", SPIFFS, "/index.htm");
@@ -266,11 +300,32 @@ void setup(void) {
   server.serveStatic("/images", SPIFFS, "/images", "max-age=86400");
   server.serveStatic("/", SPIFFS, "/index.htm");
 
+  server.onFileUpload(fileUpload);
+  
+  server.on("/timer", HTTP_POST, []() {
+    String value = server.arg("value");
+    alarm_start= now();
+    alarm = now()+value.toInt()*60;
+    sendTimer();
+  });
+  
+  server.on("/upload", HTTP_POST, []() {
+    server.send(200, "text/plain", "OK");
+    fileUpload();
+  });
+
+  server.on("/timer", HTTP_GET, []() {
+    sendTimer();
+  });
+
+  //Get ntp time
+  timeClient.begin();
+  timeClient.update();
+  //Set time
+  adjustTime(timeClient.getEpochTime()+3600);
   server.begin();
-
-  Serial.println("HTTP server started");
-
   autoPlayTimeout = millis() + (autoPlayDurationSeconds * 1000);
+
 }
 
 typedef void (*Pattern)();
@@ -327,12 +382,18 @@ const String paletteNames[paletteCount] = {
 };
 
 void loop(void) {
+
+  if (ota) {
+    ArduinoOTA.handle();
+    yield();
+  }
+  
   // Add entropy to random number generator; we use a lot of it.
   random16_add_entropy(random(65535));
 
   server.handleClient();
 
-  handleIrInput();
+  //handleIrInput();
 
   if (power == 0) {
     fill_solid(leds, NUM_LEDS, CRGB::Black);
@@ -368,12 +429,27 @@ void loop(void) {
   // Call the current pattern function once, updating the 'leds' array
   patterns[currentPatternIndex].pattern();
 
+
+  if (alarm > 0) {
+    // hvis nedtelling. 
+    if (alarm > now()) {
+      //prosent utført. 
+      double prosent = (now() - alarm_start) / (alarm - alarm_start);  
+      int lednr = prosent * NUM_LEDS;
+      leds[lednr]=CRGB::Green;
+    }
+
+  }
+
+
   FastLED.show();
 
   // insert a delay to keep the framerate modest
   FastLED.delay(1000 / FRAMES_PER_SECOND);
+  
 }
 
+/*
 void handleIrInput()
 {
   InputCommand command = readCommand(defaultHoldDelay);
@@ -580,6 +656,7 @@ void handleIrInput()
       }
   }
 }
+*/
 
 void loadSettings()
 {
@@ -613,7 +690,8 @@ void loadSettings()
 void sendAll()
 {
   String json = "{";
-
+  json += "\"time\":" + String(alarm) + ",";
+  json += "\"ota\":" + String(ota) + ",";
   json += "\"power\":" + String(power) + ",";
   json += "\"brightness\":" + String(brightness) + ",";
 
@@ -661,6 +739,12 @@ void sendPower()
   server.send(200, "text/json", json);
   json = String();
 }
+void sendOta()
+{
+  String json = String(ota);
+  server.send(200, "text/json", json);
+  json = String();
+}
 
 void sendPattern()
 {
@@ -682,6 +766,19 @@ void sendPalette()
   json = String();
 }
 
+void sendTimer()
+{
+      String json;
+      if (alarm > now()) {
+        json=String(alarm);
+      }
+      else {
+        json=String(0);
+      }
+
+    server.send(200, "text/json", json);
+    json = String();
+}
 void sendBrightness()
 {
   String json = String(brightness);
@@ -703,6 +800,10 @@ void sendSolidColor()
 void setPower(uint8_t value)
 {
   power = value == 0 ? 0 : 1;
+}
+void setOta(uint8_t value)
+{
+  ota = value == 0 ? 0 : 1;
 }
 
 void setSolidColor(CRGB color)
@@ -735,7 +836,7 @@ void adjustPattern(bool up)
   if (currentPatternIndex >= patternCount)
     currentPatternIndex = 0;
 
-  if (autoplayEnabled) {
+  if (autoplayEnabled == 0) {
     EEPROM.write(1, currentPatternIndex);
     EEPROM.commit();
   }
